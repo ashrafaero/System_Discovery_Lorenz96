@@ -1,1 +1,176 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed May 31 00:02:49 2023
 
+@author: ashraf
+"""
+
+import numpy as np
+from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
+import torch
+import pyro
+import pyro.distributions as dist
+from pyro.infer import MCMC, NUTS
+
+def lorenz96(x, F):
+    N = len(x)
+    dxdt = torch.zeros(N)
+    for k in range(N):
+        dxdt[k] = (x[(k + 1) % N] - x[(k - 2)% N]) * x[(k - 1)% N] - x[k] + F
+    return dxdt
+
+def rk4(x, F, dt):
+    k1 = lorenz96(x, F)
+    k2 = lorenz96(x + 0.5 * dt * k1, F)
+    k3 = lorenz96(x + 0.5 * dt * k2, F)
+    k4 = lorenz96(x + dt * k3, F)
+    x_new = x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return x_new
+
+# Set the number of States
+N = 10
+
+# Set the initial condition
+x0 = torch.rand(N)
+
+# Set the forcing term
+F = 10.0
+
+# Set the integration parameters
+dt = 0.005;
+t_start = 5.0
+t_end = 10.0
+
+# Create an array to store the time steps
+t_steps = torch.arange(t_start, t_end, dt)
+num_steps = len(t_steps)
+
+# Create arrays to store the solutions
+x_solution = torch.zeros((num_steps, N))
+x_solution[0] = x0
+
+# Number Of Parameters (For 2 neighbouring nodes)
+N_P=21; 
+
+# Noise parameter:
+eta = 0.01
+
+# Perform the integration
+for n in range(1, num_steps):
+    x_solution[n] = rk4(x_solution[n - 1], F, dt)
+
+
+X_state = x_solution + eta*np.random.randn(num_steps, N)# True state vaues
+
+# True RHS
+RHS_true = torch.zeros((num_steps, N)) 
+for k in range(N):
+    RHS_true[:,k]=(X_state[:,(k + 1) % N] - X_state[:,(k - 2)% N]) * X_state[:,(k - 1)% N] - X_state[:,k] + F
+
+dx_dt_state=RHS_true; # True RHS
+
+# Plot the solutions (X_state and X_dot)
+plt.figure(figsize=(10, 6))
+for k in range(N):
+    plt.plot(t_steps, X_state[:, k], label=f'Variable {k+1}')
+    plt.xlabel('Time')   
+plt.xlabel('Time (Days)')
+plt.ylabel('X (State)')
+plt.title('Lorenz \'96 System (10 states)')
+#plt.legend()
+plt.grid(True)
+plt.savefig('X_state.png', dpi=300)
+plt.show()
+
+plt.figure(figsize=(10, 6))
+for k in range(N):
+    plt.plot(t_steps, RHS_true[:, k], label=f'Variable {k+1}')
+    plt.xlabel('Time')
+plt.xlabel('Time (Days)')
+plt.ylabel('$X^{.}$ (RHS)')
+plt.title('Lorenz \'96 System (RHS)')
+#plt.legend()
+plt.grid(True)
+plt.savefig('X_state_dot.png', dpi=300)
+plt.show()
+
+
+#### Inference with Scipy.curve_fit #######
+# define the assumed dynamics:
+def func(X, d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14, d15, d16, d17, d18, d19, d20):
+  RHS_assumed = d0+d1*X[0]+d2*X[1]+d3*X[2]+d4*X[3]+d5*X[4] \
+    +d6*X[0]*X[1]+d7*X[0]*X[2]+d8*X[0]*X[3]+d9*X[0]*X[4] \
+    +d10*X[1]*X[2]+d11*X[1]*X[3]+d12*X[1]*X[4] \
+    +d13*X[2]*X[3]+d14*X[2]*X[4] \
+    +d15*X[3]*X[4] \
+    +d16*X[0]**2+d17*X[1]**2+d18*X[2]**2+d19*X[3]**2+d20*X[4]**2
+
+  return  RHS_assumed
+
+
+# Define the normal distribution parameters for initialization
+#means = [10, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # Means of the normal distributions
+#std_devs = 0.5*np.ones((N_P))  # Standard deviations of the normal distributions
+# Generate random initial parameter values from the normal distributions
+#p0 = np.random.normal(means, std_devs)
+
+# Initialization:
+N_dis = 500
+d_mean = np.zeros((N_P, N))
+x_vals = np.zeros((N_dis, N_P, N))
+y_vals = np.zeros((N_dis, N_P, N))
+RHS_assumed = np.zeros((num_steps, N))
+for k in range(N):
+  X=(X_state[:,(k-2)%N].numpy(), X_state[:,(k-1)%N].numpy(), X_state[:,k].numpy(), X_state[:,(k+1)%N].numpy(), X_state[:,(k+2)%N].numpy())
+  
+  # Data Fitting:
+  popt, pcov = curve_fit(func, X, dx_dt_state[:,k].numpy()) #, p0=p0
+  
+  # Assumed RHS:
+  d = popt   
+  RHS_assumed [:,k] = func(X, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19], d[20])
+  
+  # Generate x values for plotting the normal distribution
+  d_mean[:,k] = popt
+  dd_std_dev = np.sqrt(np.diag(pcov))
+  d_std_dev = np.where((dd_std_dev < 1e07) & (dd_std_dev > 1e-07), dd_std_dev, 1e-07)
+  x_vals[:,:,k]= np.linspace(min([d_mean[:,k] - 3 * d_std_dev]), max([d_mean[:,k] + 3 * d_std_dev]) , N_dis)
+  # Normal Distribution Density Function
+  y_vals[:,:,k]= (1 / (d_std_dev * np.sqrt(2 * np.pi))) * np.exp(-(x_vals[:,:,k] - d_mean[:,k])**2 / (2 * d_std_dev**2))  
+  #y_vals[:,:,k] = np.where(d_std_dev != 0, (1 / (d_std_dev * np.sqrt(2 * np.pi))) * np.exp(-(x_vals[:,:,k] - d_mean[:,k])**2 / (2 * d_std_dev**2)), 0)
+
+
+plt.figure(figsize=(10, 6))
+#for k in range(N):
+#plt.plot(t_steps.numpy(), RHS_assumed[:, 1], 'b',label='Discovered RHS') 
+plt.plot(t_steps.numpy(), RHS_assumed[:, 1] - RHS_true[:, 1].numpy(), '--r')  
+plt.xlabel('Time') 
+    
+plt.xlabel('Time (Days)')
+plt.ylabel('ERROR')
+plt.title('ERROR')
+#plt.legend()
+plt.grid(True)
+#plt.savefig('X_state_dot_discovered.png', dpi=300)
+plt.show()
+
+# Distribution Plot:
+x_para = np.zeros((N_dis, N_P))
+y_density = np.zeros((N_dis, N_P))
+
+for i in range (N_P):
+  for j in range (N_dis):
+    x_para[j,i]= np.mean(x_vals[j,i,:])
+    y_density[j,i] = np.mean(y_vals[j,i,:])
+  
+for i in range (N_P):
+  print('d'+"{}".format(i), popt[i])
+  plt.plot(x_para[:,i], y_density[:,i],label='d'+"{}".format(i))
+  # plt.hist(x_para[:,i], density=True, alpha=0.5, label='d{}'.format(i))
+  plt.xlabel('d'+"{}".format(i))
+  plt.ylabel('Density')
+  plt.legend()
+  plt.grid(True)
+  plt.show()
